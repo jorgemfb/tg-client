@@ -36,19 +36,40 @@
 #define DEFAULT_DOWNLOAD_DIR "./videos_descargados"
 #define DOWNLOAD_PRIORITY 32
 #define MAX_TRACKED_FILES 1000
+#define PROGRESS_UPDATE_SECONDS 2
+#define PROGRESS_UPDATE_PERCENT_STEP 5
 
 static volatile sig_atomic_t running = 1;
 static void *client = NULL;
 static char download_dir[PATH_MAX] = {0};
-static int pending_file_ids[MAX_TRACKED_FILES] = {0};
-static int pending_count = 0;
 static char *last_sent_payload = NULL;
 static FILE *app_log_file = NULL;
 static FILE *tdlib_log_file = NULL;
 static char logs_dir[PATH_MAX] = {0};
 static time_t last_log_cleanup = 0;
 
+typedef struct {
+    int file_id;
+    long long chat_id;
+    long long temp_progress_message_id;
+    long long progress_message_id;
+    int last_reported_percent;
+    time_t last_progress_update;
+} PendingDownload;
+
+static PendingDownload pending_downloads[MAX_TRACKED_FILES] = {0};
+static int pending_count = 0;
+
 static int mkdir_p(const char *path);
+
+static PendingDownload *find_pending_download(int file_id) {
+    for (int i = 0; i < pending_count; ++i) {
+        if (pending_downloads[i].file_id == file_id) {
+            return &pending_downloads[i];
+        }
+    }
+    return NULL;
+}
 
 static int get_executable_dir(char *buffer, size_t buffer_size) {
     char exe_path[PATH_MAX];
@@ -574,6 +595,60 @@ static int extract_chat_id(const char *update_json, long long *chat_id) {
     return 1;
 }
 
+static int extract_message_id(const char *update_json, long long *message_id) {
+    char *endptr = NULL;
+    long long value;
+    const char *pos;
+
+    if (!update_json || !message_id) {
+        return 0;
+    }
+
+    pos = strstr(update_json, "\"id\":");
+    if (!pos) {
+        return 0;
+    }
+
+    pos += strlen("\"id\":");
+    errno = 0;
+    value = strtoll(pos, &endptr, 10);
+    if (errno != 0 || endptr == pos) {
+        return 0;
+    }
+
+    *message_id = value;
+    return 1;
+}
+
+static int extract_old_message_id(const char *update_json, long long *message_id) {
+    char *endptr = NULL;
+    long long value;
+    const char *pos;
+
+    if (!update_json || !message_id) {
+        return 0;
+    }
+
+    pos = strstr(update_json, "\"old_message_id\":");
+    if (!pos) {
+        return 0;
+    }
+
+    pos += strlen("\"old_message_id\":");
+    errno = 0;
+    value = strtoll(pos, &endptr, 10);
+    if (errno != 0 || endptr == pos) {
+        return 0;
+    }
+
+    *message_id = value;
+    return 1;
+}
+
+static int extract_extra(const char *update_json, char *buffer, size_t bufsize) {
+    return json_extract_string_after(update_json, "\"@extra\":\"", buffer, bufsize);
+}
+
 static int extract_video_file_id(const char *update_json, int *file_id, char *detected_type, size_t detected_type_size) {
     const char *message_video;
     const char *message_document;
@@ -633,27 +708,61 @@ static int extract_update_file_id(const char *update_json, int *file_id) {
            json_extract_int_after(update_json, "\"id\":", file_id);
 }
 
+static int extract_file_size(const char *update_json, int *size) {
+    const char *file = strstr(update_json, "\"file\":{");
+
+    if (file) {
+        if (json_extract_int_after(file, "\"size\":", size) ||
+            json_extract_int_after(file, "\"expected_size\":", size)) {
+            return 1;
+        }
+    }
+
+    return json_extract_int_after(update_json, "\"size\":", size) ||
+           json_extract_int_after(update_json, "\"expected_size\":", size);
+}
+
+static int extract_downloaded_size(const char *update_json, int *size) {
+    const char *local = strstr(update_json, "\"local\":{");
+
+    if (!local) {
+        return 0;
+    }
+
+    return json_extract_int_after(local, "\"downloaded_size\":", size) ||
+           json_extract_int_after(local, "\"downloaded_prefix_size\":", size);
+}
+
 static int extract_local_file_path(const char *update_json, char *buffer, size_t bufsize) {
     return json_extract_string_after(update_json, "\"local\":{\"path\":\"", buffer, bufsize) ||
            json_extract_string_after(update_json, "\"path\":\"", buffer, bufsize);
 }
 
 static int is_pending(int file_id) {
-    for (int i = 0; i < pending_count; ++i) {
-        if (pending_file_ids[i] == file_id) {
-            return 1;
-        }
-    }
-    return 0;
+    return find_pending_download(file_id) != NULL;
 }
 
-static void remember_pending(int file_id) {
+static void remember_pending(int file_id, long long chat_id) {
+    PendingDownload *pending;
+
+    pending = find_pending_download(file_id);
+    if (pending) {
+        pending->chat_id = chat_id;
+        return;
+    }
+
     if (is_pending(file_id)) {
         return;
     }
 
     if (pending_count < MAX_TRACKED_FILES) {
-        pending_file_ids[pending_count++] = file_id;
+        pending_downloads[pending_count].file_id = file_id;
+        pending_downloads[pending_count].chat_id = chat_id;
+        pending_downloads[pending_count].temp_progress_message_id = 0;
+        pending_downloads[pending_count].progress_message_id = 0;
+        pending_downloads[pending_count].last_reported_percent = -1;
+        pending_downloads[pending_count].last_progress_update = 0;
+        ++pending_count;
         return;
     }
 
@@ -662,9 +771,9 @@ static void remember_pending(int file_id) {
 
 static void forget_pending(int file_id) {
     for (int i = 0; i < pending_count; ++i) {
-        if (pending_file_ids[i] == file_id) {
-            pending_file_ids[i] = pending_file_ids[pending_count - 1];
-            pending_file_ids[pending_count - 1] = 0;
+        if (pending_downloads[i].file_id == file_id) {
+            pending_downloads[i] = pending_downloads[pending_count - 1];
+            memset(&pending_downloads[pending_count - 1], 0, sizeof(pending_downloads[pending_count - 1]));
             --pending_count;
             return;
         }
@@ -690,6 +799,59 @@ static void bot_send(const char *json_str) {
         last_sent_payload = payload;
         td_json_client_send(client, last_sent_payload);
     }
+}
+
+static void send_text_message(long long chat_id, const char *text, const char *extra) {
+    char payload[2048];
+    int written;
+
+    written = snprintf(
+        payload,
+        sizeof(payload),
+        extra && extra[0] != '\0' ?
+            "{\"@type\":\"sendMessage\",\"chat_id\":%lld,\"@extra\":\"%s\","
+            "\"input_message_content\":{\"@type\":\"inputMessageText\","
+            "\"text\":{\"@type\":\"formattedText\",\"text\":\"%s\"},"
+            "\"disable_web_page_preview\":true,\"clear_draft\":false}}" :
+            "{\"@type\":\"sendMessage\",\"chat_id\":%lld,"
+            "\"input_message_content\":{\"@type\":\"inputMessageText\","
+            "\"text\":{\"@type\":\"formattedText\",\"text\":\"%s\"},"
+            "\"disable_web_page_preview\":true,\"clear_draft\":false}}",
+        chat_id,
+        extra,
+        text
+    );
+
+    if (written < 0 || (size_t)written >= sizeof(payload)) {
+        log_error("No se pudo construir un sendMessage para chat_id=%lld", chat_id);
+        return;
+    }
+
+    bot_send(payload);
+}
+
+static void edit_text_message(long long chat_id, long long message_id, const char *text) {
+    char payload[2048];
+    int written;
+
+    written = snprintf(
+        payload,
+        sizeof(payload),
+        "{\"@type\":\"editMessageText\",\"chat_id\":%lld,\"message_id\":%lld,"
+        "\"input_message_content\":{\"@type\":\"inputMessageText\","
+        "\"text\":{\"@type\":\"formattedText\",\"text\":\"%s\"},"
+        "\"disable_web_page_preview\":true,\"clear_draft\":false}}",
+        chat_id,
+        message_id,
+        text
+    );
+
+    if (written < 0 || (size_t)written >= sizeof(payload)) {
+        log_error("No se pudo construir un editMessageText para message_id=%lld", message_id);
+        return;
+    }
+
+    bot_send(payload);
 }
 
 static void send_tdlib_parameters(int api_id, const char *api_hash, const char *db_dir, const char *files_dir) {
@@ -861,8 +1023,9 @@ static void handle_authorization_state(const char *update_json, int api_id, cons
     }
 }
 
-static void request_download(int file_id) {
+static void request_download(int file_id, long long chat_id) {
     char download_cmd[256];
+    char extra[64];
     int written;
 
     written = snprintf(
@@ -878,8 +1041,10 @@ static void request_download(int file_id) {
         return;
     }
 
+    snprintf(extra, sizeof(extra), "progress_init:%d", file_id);
+    send_text_message(chat_id, "Iniciando descarga...", extra);
     bot_send(download_cmd);
-    remember_pending(file_id);
+    remember_pending(file_id, chat_id);
     log_info("Vídeo detectado. Solicitando descarga para file_id=%d", file_id);
 }
 
@@ -920,50 +1085,177 @@ static void handle_new_message(const char *update_json) {
     }
 
     log_info("Archivo detectado como %s con file_id=%d", detected_type, file_id);
-    request_download(file_id);
+    request_download(file_id, chat_id);
+}
+
+static void update_progress_message(const char *update_json, int file_id) {
+    PendingDownload *pending;
+    char text[256];
+    int downloaded_size = 0;
+    int total_size = 0;
+    int percent = 0;
+    double downloaded_mb;
+    double total_mb;
+    time_t now;
+
+    pending = find_pending_download(file_id);
+    if (!pending || pending->progress_message_id == 0) {
+        return;
+    }
+
+    if (!extract_downloaded_size(update_json, &downloaded_size)) {
+        return;
+    }
+
+    extract_file_size(update_json, &total_size);
+    if (total_size > 0) {
+        percent = (int)(((long long)downloaded_size * 100LL) / (long long)total_size);
+        if (percent > 100) {
+            percent = 100;
+        }
+    }
+
+    now = time(NULL);
+    if (pending->last_reported_percent >= 0 &&
+        percent < 100 &&
+        percent < pending->last_reported_percent + PROGRESS_UPDATE_PERCENT_STEP &&
+        now != (time_t)-1 &&
+        pending->last_progress_update != 0 &&
+        now - pending->last_progress_update < PROGRESS_UPDATE_SECONDS) {
+        return;
+    }
+
+    downloaded_mb = (double)downloaded_size / (1024.0 * 1024.0);
+    total_mb = (double)total_size / (1024.0 * 1024.0);
+
+    if (total_size > 0) {
+        snprintf(
+            text,
+            sizeof(text),
+            "Descargando... %d%% (%.1f/%.1f MB)",
+            percent,
+            downloaded_mb,
+            total_mb
+        );
+    } else {
+        snprintf(
+            text,
+            sizeof(text),
+            "Descargando... %.1f MB",
+            downloaded_mb
+        );
+    }
+
+    edit_text_message(pending->chat_id, pending->progress_message_id, text);
+    pending->last_reported_percent = percent;
+    if (now != (time_t)-1) {
+        pending->last_progress_update = now;
+    }
+}
+
+static void handle_progress_message_result(const char *update_json) {
+    char extra[64];
+    PendingDownload *pending;
+    long long message_id = 0;
+    int file_id = 0;
+
+    if (!extract_extra(update_json, extra, sizeof(extra))) {
+        return;
+    }
+
+    if (sscanf(extra, "progress_init:%d", &file_id) != 1) {
+        return;
+    }
+
+    pending = find_pending_download(file_id);
+    if (!pending) {
+        return;
+    }
+
+    if (!extract_message_id(update_json, &message_id)) {
+        return;
+    }
+
+    pending->temp_progress_message_id = message_id;
+    pending->last_reported_percent = 0;
+    pending->last_progress_update = time(NULL);
+}
+
+static void handle_message_send_succeeded(const char *update_json) {
+    long long old_message_id = 0;
+    long long new_message_id = 0;
+
+    if (!strstr(update_json, "\"@type\":\"updateMessageSendSucceeded\"")) {
+        return;
+    }
+
+    if (!extract_old_message_id(update_json, &old_message_id) ||
+        !extract_message_id(update_json, &new_message_id)) {
+        return;
+    }
+
+    for (int i = 0; i < pending_count; ++i) {
+        if (pending_downloads[i].temp_progress_message_id == old_message_id) {
+            pending_downloads[i].progress_message_id = new_message_id;
+            return;
+        }
+    }
 }
 
 static void handle_file_update(const char *update_json) {
     int file_id = 0;
+    PendingDownload *pending;
     char src_path[PATH_MAX];
     char final_path[PATH_MAX];
     const char *filename;
-
-    if (!strstr(update_json, "\"is_downloading_completed\":true")) {
-        return;
-    }
 
     if (!extract_update_file_id(update_json, &file_id) || !is_pending(file_id)) {
         return;
     }
 
-    memset(src_path, 0, sizeof(src_path));
-    if (!extract_local_file_path(update_json, src_path, sizeof(src_path)) || src_path[0] == '\0') {
-        log_error("La descarga del file_id=%d terminó sin ruta local válida", file_id);
+    pending = find_pending_download(file_id);
+    if (strstr(update_json, "\"is_downloading_completed\":true")) {
+        memset(src_path, 0, sizeof(src_path));
+        if (!extract_local_file_path(update_json, src_path, sizeof(src_path)) || src_path[0] == '\0') {
+            log_error("La descarga del file_id=%d terminó sin ruta local válida", file_id);
+            forget_pending(file_id);
+            return;
+        }
+
+        filename = strrchr(src_path, '/');
+        filename = filename ? filename + 1 : src_path;
+
+        if (build_unique_destination(filename, final_path, sizeof(final_path)) != 0) {
+            log_error("No se pudo preparar el destino para '%s': %s", filename, strerror(errno));
+            return;
+        }
+
+        if (rename(src_path, final_path) != 0) {
+            log_error("No se pudo mover '%s' a '%s': %s", src_path, final_path, strerror(errno));
+            if (pending && pending->progress_message_id != 0) {
+                edit_text_message(pending->chat_id, pending->progress_message_id, "La descarga terminó, pero no se pudo mover el archivo.");
+            }
+            return;
+        }
+
+        if (pending && pending->progress_message_id != 0) {
+            edit_text_message(pending->chat_id, pending->progress_message_id, "Descarga completada.");
+        }
+
         forget_pending(file_id);
+        log_info("Descarga completada: %s", final_path);
         return;
     }
 
-    filename = strrchr(src_path, '/');
-    filename = filename ? filename + 1 : src_path;
-
-    if (build_unique_destination(filename, final_path, sizeof(final_path)) != 0) {
-        log_error("No se pudo preparar el destino para '%s': %s", filename, strerror(errno));
-        return;
-    }
-
-    if (rename(src_path, final_path) != 0) {
-        log_error("No se pudo mover '%s' a '%s': %s", src_path, final_path, strerror(errno));
-        return;
-    }
-
-    forget_pending(file_id);
-    log_info("Descarga completada: %s", final_path);
+    update_progress_message(update_json, file_id);
 }
 
 static void handle_update(const char *update_json, int api_id, const char *api_hash, const char *db_dir,
                           const char *files_dir, const char *bot_token, const char *database_key) {
     char message[512];
+
+    handle_progress_message_result(update_json);
+    handle_message_send_succeeded(update_json);
 
     if (strstr(update_json, "\"@type\":\"error\"")) {
         memset(message, 0, sizeof(message));
