@@ -39,6 +39,7 @@
 #define MAX_TRACKED_FILES 1000
 #define PROGRESS_UPDATE_SECONDS 2
 #define PROGRESS_UPDATE_PERCENT_STEP 5
+#define LOG_PROGRESS_BYTES_STEP (5LL * 1024LL * 1024LL)
 
 static volatile sig_atomic_t running = 1;
 static void *client = NULL;
@@ -56,6 +57,11 @@ typedef struct {
     long long progress_message_id;
     long long total_size;
     int last_reported_percent;
+    int last_logged_percent;
+    long long last_logged_downloaded_size;
+    int last_download_active;
+    int last_download_completed;
+    int last_can_be_downloaded;
     time_t started_at;
     time_t last_progress_update;
 } PendingDownload;
@@ -702,6 +708,32 @@ static int json_extract_long_long_after(const char *start, const char *pattern, 
     return 1;
 }
 
+static int json_extract_bool_after(const char *start, const char *pattern, int *out) {
+    const char *pos;
+
+    if (!start || !pattern || !out) {
+        return 0;
+    }
+
+    pos = strstr(start, pattern);
+    if (!pos) {
+        return 0;
+    }
+
+    pos += strlen(pattern);
+    if (strncmp(pos, "true", 4) == 0) {
+        *out = 1;
+        return 1;
+    }
+
+    if (strncmp(pos, "false", 5) == 0) {
+        *out = 0;
+        return 1;
+    }
+
+    return 0;
+}
+
 static int json_extract_error_message(const char *json, char *buffer, size_t bufsize) {
     return json_extract_string_after(json, "\"message\":\"", buffer, bufsize);
 }
@@ -881,7 +913,23 @@ static int extract_message_total_size(const char *update_json, int file_id, long
 }
 
 static int extract_update_file_id(const char *update_json, int *file_id) {
-    return json_extract_int_after(update_json, "\"file\":{\"id\":", file_id);
+    const char *file_section;
+
+    if (!update_json || !file_id) {
+        return 0;
+    }
+
+    file_section = strstr(update_json, "\"file\":{");
+    if (!file_section) {
+        return 0;
+    }
+
+    if (json_extract_int_after(file_section, "\"id\":", file_id)) {
+        return 1;
+    }
+
+    return json_extract_int_after(update_json, "\"file\":{\"id\":", file_id) ||
+           json_extract_int_after(update_json, "\"file\":{\"@type\":\"file\",\"id\":", file_id);
 }
 
 static int extract_file_size(const char *update_json, long long *size) {
@@ -946,7 +994,18 @@ static int extract_downloaded_size(const char *update_json, long long *size) {
 }
 
 static int extract_local_file_path(const char *update_json, char *buffer, size_t bufsize) {
-    return json_extract_string_after(update_json, "\"local\":{\"path\":\"", buffer, bufsize);
+    const char *local_section;
+
+    if (!update_json || !buffer || bufsize == 0) {
+        return 0;
+    }
+
+    local_section = strstr(update_json, "\"local\":{");
+    if (!local_section) {
+        return 0;
+    }
+
+    return json_extract_string_after(local_section, "\"path\":\"", buffer, bufsize);
 }
 
 static int is_pending(int file_id) {
@@ -962,6 +1021,11 @@ static void init_pending_download(PendingDownload *pending, int file_id, long lo
     pending->file_id = file_id;
     pending->chat_id = chat_id;
     pending->last_reported_percent = -1;
+    pending->last_logged_percent = -1;
+    pending->last_logged_downloaded_size = -1;
+    pending->last_download_active = -1;
+    pending->last_download_completed = -1;
+    pending->last_can_be_downloaded = -1;
     pending->started_at = started_at;
 }
 
@@ -1376,13 +1440,14 @@ static void update_progress_message(const char *update_json, int file_id) {
     char text[256];
     long long downloaded_size = 0;
     long long total_size = 0;
+    long long progress_message_id;
     int percent = 0;
     double downloaded_mb;
     double total_mb;
     time_t now;
 
     pending = find_pending_download(file_id);
-    if (!pending || pending->progress_message_id == 0) {
+    if (!pending) {
         return;
     }
 
@@ -1390,9 +1455,16 @@ static void update_progress_message(const char *update_json, int file_id) {
         return;
     }
 
+    progress_message_id = pending->progress_message_id;
+    if (progress_message_id == 0 && pending->temp_progress_message_id > 0) {
+        progress_message_id = pending->temp_progress_message_id;
+    }
     extract_file_size(update_json, &total_size);
     if (total_size <= 0 && pending->total_size > 0) {
         total_size = pending->total_size;
+    }
+    if (total_size > 0) {
+        pending->total_size = total_size;
     }
     if (total_size > 0) {
         percent = (int)((downloaded_size * 100LL) / total_size);
@@ -1432,10 +1504,111 @@ static void update_progress_message(const char *update_json, int file_id) {
         );
     }
 
-    edit_text_message(pending->chat_id, pending->progress_message_id, text);
+    if (progress_message_id != 0) {
+        edit_text_message(pending->chat_id, progress_message_id, text);
+    } else {
+        send_text_message(pending->chat_id, text, NULL);
+    }
     pending->last_reported_percent = percent;
     if (now != (time_t)-1) {
         pending->last_progress_update = now;
+    }
+}
+
+static void log_download_state_update(const char *update_json, PendingDownload *pending, int file_id) {
+    const char *local;
+    long long downloaded_size = 0;
+    long long total_size = 0;
+    int has_downloaded_size = 0;
+    int has_total_size = 0;
+    int is_downloading_active = -1;
+    int is_downloading_completed = -1;
+    int can_be_downloaded = -1;
+    int percent = -1;
+
+    if (!update_json || !pending) {
+        return;
+    }
+
+    local = strstr(update_json, "\"local\":{");
+    if (local) {
+        json_extract_bool_after(local, "\"is_downloading_active\":", &is_downloading_active);
+        json_extract_bool_after(local, "\"is_downloading_completed\":", &is_downloading_completed);
+        json_extract_bool_after(local, "\"can_be_downloaded\":", &can_be_downloaded);
+    }
+
+    has_downloaded_size = extract_downloaded_size(update_json, &downloaded_size);
+    has_total_size = extract_file_size(update_json, &total_size);
+    if (has_total_size && total_size > 0) {
+        pending->total_size = total_size;
+    } else if (pending->total_size > 0) {
+        total_size = pending->total_size;
+        has_total_size = 1;
+    }
+
+    if (has_downloaded_size && has_total_size && total_size > 0) {
+        percent = (int)((downloaded_size * 100LL) / total_size);
+        if (percent > 100) {
+            percent = 100;
+        }
+    }
+
+    if (is_downloading_active != -1 && is_downloading_active != pending->last_download_active) {
+        log_info(
+            "Estado descarga file_id=%d: is_downloading_active=%s",
+            file_id,
+            is_downloading_active ? "true" : "false"
+        );
+        pending->last_download_active = is_downloading_active;
+    }
+
+    if (can_be_downloaded != -1 && can_be_downloaded != pending->last_can_be_downloaded) {
+        log_info(
+            "Estado descarga file_id=%d: can_be_downloaded=%s",
+            file_id,
+            can_be_downloaded ? "true" : "false"
+        );
+        pending->last_can_be_downloaded = can_be_downloaded;
+    }
+
+    if (is_downloading_completed != -1 && is_downloading_completed != pending->last_download_completed) {
+        log_info(
+            "Estado descarga file_id=%d: is_downloading_completed=%s",
+            file_id,
+            is_downloading_completed ? "true" : "false"
+        );
+        pending->last_download_completed = is_downloading_completed;
+    }
+
+    if (!has_downloaded_size) {
+        return;
+    }
+
+    if (percent >= 0) {
+        if (pending->last_logged_percent < 0 ||
+            percent >= pending->last_logged_percent + PROGRESS_UPDATE_PERCENT_STEP ||
+            percent == 100) {
+            log_info(
+                "Progreso descarga file_id=%d: %d%% (%lld/%lld bytes)",
+                file_id,
+                percent,
+                downloaded_size,
+                total_size
+            );
+            pending->last_logged_percent = percent;
+            pending->last_logged_downloaded_size = downloaded_size;
+        }
+        return;
+    }
+
+    if (pending->last_logged_downloaded_size < 0 ||
+        downloaded_size >= pending->last_logged_downloaded_size + LOG_PROGRESS_BYTES_STEP) {
+        log_info(
+            "Progreso descarga file_id=%d: %lld bytes descargados",
+            file_id,
+            downloaded_size
+        );
+        pending->last_logged_downloaded_size = downloaded_size;
     }
 }
 
@@ -1463,8 +1636,11 @@ static void handle_progress_message_result(const char *update_json) {
     }
 
     pending->temp_progress_message_id = message_id;
-    pending->last_reported_percent = 0;
-    pending->last_progress_update = time(NULL);
+    if (message_id > 0) {
+        pending->progress_message_id = message_id;
+    }
+    pending->last_reported_percent = -1;
+    pending->last_progress_update = 0;
 }
 
 static void handle_message_send_succeeded(const char *update_json) {
@@ -1481,8 +1657,10 @@ static void handle_message_send_succeeded(const char *update_json) {
     }
 
     for (int i = 0; i < pending_count; ++i) {
-        if (pending_downloads[i].temp_progress_message_id == old_message_id) {
+        if (pending_downloads[i].temp_progress_message_id == old_message_id ||
+            pending_downloads[i].progress_message_id == old_message_id) {
             pending_downloads[i].progress_message_id = new_message_id;
+            pending_downloads[i].temp_progress_message_id = new_message_id;
             return;
         }
     }
@@ -1499,11 +1677,27 @@ static void handle_file_update(const char *update_json) {
     const char *filename;
     time_t finished_time;
 
-    if (!extract_update_file_id(update_json, &file_id) || !is_pending(file_id)) {
+    if (!extract_update_file_id(update_json, &file_id)) {
+        if (pending_count > 0) {
+            log_info("updateFile recibido sin file_id parseable mientras hay %d descargas pendientes", pending_count);
+        }
+        return;
+    }
+
+    if (!is_pending(file_id)) {
+        if (pending_count > 0) {
+            log_info(
+                "updateFile ignorado para file_id=%d (no pendiente). Pendientes actuales=%d",
+                file_id,
+                pending_count
+            );
+        }
         return;
     }
 
     pending = find_pending_download(file_id);
+    log_download_state_update(update_json, pending, file_id);
+    update_progress_message(update_json, file_id);
     if (strstr(update_json, "\"is_downloading_completed\":true")) {
         memset(src_path, 0, sizeof(src_path));
         if (!extract_local_file_path(update_json, src_path, sizeof(src_path)) || src_path[0] == '\0') {
@@ -1524,12 +1718,16 @@ static void handle_file_update(const char *update_json) {
             log_error("No se pudo mover '%s' a '%s': %s", src_path, final_path, strerror(errno));
             if (pending && pending->progress_message_id != 0) {
                 edit_text_message(pending->chat_id, pending->progress_message_id, "La descarga terminó, pero no se pudo mover el archivo.");
+            } else if (pending) {
+                send_text_message(pending->chat_id, "La descarga terminó, pero no se pudo mover el archivo.", NULL);
             }
             return;
         }
 
         if (pending && pending->progress_message_id != 0) {
             edit_text_message(pending->chat_id, pending->progress_message_id, "Descarga completada.");
+        } else if (pending) {
+            send_text_message(pending->chat_id, "Descarga completada.", NULL);
         }
 
         finished_time = time(NULL);
@@ -1548,8 +1746,6 @@ static void handle_file_update(const char *update_json) {
         );
         return;
     }
-
-    update_progress_message(update_json, file_id);
 }
 
 static void handle_update(const char *update_json, int api_id, const char *api_hash, const char *db_dir,
