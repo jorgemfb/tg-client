@@ -1,0 +1,13 @@
+.codex
+.env
+
+bot
+botC
+*.o
+build/
+
+logs/
+tdlib/
+downloads/
+descargas/
+videos_descargados/
