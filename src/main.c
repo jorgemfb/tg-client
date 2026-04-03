@@ -59,8 +59,54 @@ typedef struct {
     time_t last_progress_update;
 } PendingDownload;
 
+typedef struct {
+    const char *message_type;
+    const char *mime_substring;
+    const char *container_pattern;
+    const char *file_pattern;
+    const char *nested_file_pattern;
+    const char *size_prefix;
+} MediaPattern;
+
 static PendingDownload pending_downloads[MAX_TRACKED_FILES] = {0};
 static int pending_count = 0;
+
+static const MediaPattern media_patterns[] = {
+    {
+        "messageVideo",
+        NULL,
+        "\"video\":{",
+        "\"video\":{\"@type\":\"file\",\"id\":",
+        "\"video\":{\"video\":{\"id\":",
+        "\"video\":{\"video\":{"
+    },
+    {
+        "messageDocument",
+        "\"mime_type\":\"video/",
+        "\"document\":{",
+        "\"document\":{\"@type\":\"file\",\"id\":",
+        "\"document\":{\"document\":{\"id\":",
+        "\"document\":{\"document\":{"
+    },
+    {
+        "messageAnimation",
+        NULL,
+        "\"animation\":{",
+        "\"animation\":{\"@type\":\"file\",\"id\":",
+        "\"animation\":{\"animation\":{\"id\":",
+        "\"animation\":{\"animation\":{"
+    },
+    {
+        "messageVideoNote",
+        NULL,
+        "\"video_note\":{",
+        "\"video\":{\"@type\":\"file\",\"id\":",
+        "\"video_note\":{\"video\":{\"id\":",
+        "\"video_note\":{\"video\":{"
+    }
+};
+
+static const size_t media_pattern_count = sizeof(media_patterns) / sizeof(media_patterns[0]);
 
 static int mkdir_p(const char *path);
 
@@ -432,6 +478,74 @@ static int make_absolute_path(const char *input, char *output, size_t output_siz
     return 0;
 }
 
+static int json_escape_string(const char *input, char *output, size_t output_size) {
+    size_t out = 0;
+
+    if (!input || !output || output_size == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    while (*input) {
+        const char *replacement = NULL;
+        char unicode_escape[7];
+        unsigned char ch = (unsigned char)*input++;
+
+        switch (ch) {
+            case '"':
+                replacement = "\\\"";
+                break;
+            case '\\':
+                replacement = "\\\\";
+                break;
+            case '\b':
+                replacement = "\\b";
+                break;
+            case '\f':
+                replacement = "\\f";
+                break;
+            case '\n':
+                replacement = "\\n";
+                break;
+            case '\r':
+                replacement = "\\r";
+                break;
+            case '\t':
+                replacement = "\\t";
+                break;
+            default:
+                if (ch < 0x20) {
+                    snprintf(unicode_escape, sizeof(unicode_escape), "\\u%04x", ch);
+                    replacement = unicode_escape;
+                }
+                break;
+        }
+
+        if (replacement) {
+            size_t replacement_len = strlen(replacement);
+
+            if (out + replacement_len >= output_size) {
+                errno = ENAMETOOLONG;
+                return -1;
+            }
+
+            memcpy(output + out, replacement, replacement_len);
+            out += replacement_len;
+            continue;
+        }
+
+        if (out + 1 >= output_size) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+
+        output[out++] = (char)ch;
+    }
+
+    output[out] = '\0';
+    return 0;
+}
+
 static int json_extract_string_after(const char *start, const char *pattern, char *buffer, size_t bufsize) {
     const char *pos;
     size_t out = 0;
@@ -692,12 +806,16 @@ static int extract_message_id(const char *update_json, long long *message_id) {
         return 0;
     }
 
-    pos = strstr(update_json, "\"id\":");
-    if (!pos) {
-        return 0;
+    pos = strstr(update_json, "\"message\":{\"id\":");
+    if (pos) {
+        pos += strlen("\"message\":{\"id\":");
+    } else {
+        pos = strstr(update_json, "\"id\":");
+        if (!pos) {
+            return 0;
+        }
+        pos += strlen("\"id\":");
     }
-
-    pos += strlen("\"id\":");
     errno = 0;
     value = strtoll(pos, &endptr, 10);
     if (errno != 0 || endptr == pos) {
@@ -737,104 +855,73 @@ static int extract_extra(const char *update_json, char *buffer, size_t bufsize) 
     return json_extract_string_after(update_json, "\"@extra\":\"", buffer, bufsize);
 }
 
+static const MediaPattern *find_media_pattern(const char *update_json, const char **message_start) {
+    for (size_t i = 0; i < media_pattern_count; ++i) {
+        const MediaPattern *pattern = &media_patterns[i];
+        const char *candidate = strstr(update_json, pattern->message_type);
+
+        if (!candidate) {
+            continue;
+        }
+
+        if (pattern->mime_substring && !strstr(candidate, pattern->mime_substring)) {
+            continue;
+        }
+
+        if (message_start) {
+            *message_start = candidate;
+        }
+
+        return pattern;
+    }
+
+    if (message_start) {
+        *message_start = NULL;
+    }
+
+    return NULL;
+}
+
 static int extract_video_file_id(const char *update_json, int *file_id, char *detected_type, size_t detected_type_size) {
-    const char *message_video;
-    const char *message_document;
-    const char *message_animation;
-    const char *message_video_note;
+    const char *message_start = NULL;
+    const MediaPattern *pattern = find_media_pattern(update_json, &message_start);
 
-    message_video = strstr(update_json, "\"@type\":\"messageVideo\"");
-    if (message_video &&
-        (extract_nested_file_id(message_video, "\"video\":{", "\"video\":{\"@type\":\"file\",\"id\":", file_id) ||
-         json_extract_int_after(message_video, "\"video\":{\"video\":{\"id\":", file_id) ||
-         json_extract_int_after(message_video, "\"video\":{\"id\":", file_id))) {
-        if (detected_type && detected_type_size > 0) {
-            snprintf(detected_type, detected_type_size, "%s", "messageVideo");
-        }
-        return 1;
+    if (!pattern || !message_start) {
+        return 0;
     }
 
-    message_document = strstr(update_json, "\"@type\":\"messageDocument\"");
-    if (message_document &&
-        strstr(message_document, "\"mime_type\":\"video/") &&
-        (extract_nested_file_id(message_document, "\"document\":{", "\"document\":{\"@type\":\"file\",\"id\":", file_id) ||
-         json_extract_int_after(message_document, "\"document\":{\"document\":{\"id\":", file_id) ||
-         json_extract_int_after(message_document, "\"document\":{\"id\":", file_id))) {
-        if (detected_type && detected_type_size > 0) {
-            snprintf(detected_type, detected_type_size, "%s", "messageDocument");
-        }
-        return 1;
+    if (!(extract_nested_file_id(message_start, pattern->container_pattern, pattern->file_pattern, file_id) ||
+          json_extract_int_after(message_start, pattern->nested_file_pattern, file_id) ||
+          json_extract_int_after(message_start, pattern->file_pattern, file_id))) {
+        return 0;
     }
 
-    message_animation = strstr(update_json, "\"@type\":\"messageAnimation\"");
-    if (message_animation &&
-        (extract_nested_file_id(message_animation, "\"animation\":{", "\"animation\":{\"@type\":\"file\",\"id\":", file_id) ||
-         json_extract_int_after(message_animation, "\"animation\":{\"animation\":{\"id\":", file_id) ||
-         json_extract_int_after(message_animation, "\"animation\":{\"id\":", file_id))) {
-        if (detected_type && detected_type_size > 0) {
-            snprintf(detected_type, detected_type_size, "%s", "messageAnimation");
-        }
-        return 1;
+    if (detected_type && detected_type_size > 0) {
+        snprintf(detected_type, detected_type_size, "%s", pattern->message_type);
     }
 
-    message_video_note = strstr(update_json, "\"@type\":\"messageVideoNote\"");
-    if (message_video_note &&
-        (extract_nested_file_id(message_video_note, "\"video_note\":{", "\"video\":{\"@type\":\"file\",\"id\":", file_id) ||
-         json_extract_int_after(message_video_note, "\"video_note\":{\"video\":{\"id\":", file_id) ||
-         json_extract_int_after(message_video_note, "\"video_note\":{\"id\":", file_id))) {
-        if (detected_type && detected_type_size > 0) {
-            snprintf(detected_type, detected_type_size, "%s", "messageVideoNote");
-        }
-        return 1;
-    }
-
-    return 0;
+    return 1;
 }
 
 static int extract_message_total_size(const char *update_json, int file_id, long long *size) {
-    const char *message_video;
-    const char *message_document;
-    const char *message_animation;
-    const char *message_video_note;
+    const char *message_start = NULL;
+    const MediaPattern *pattern;
 
     if (!update_json || !size) {
         return 0;
     }
 
-    message_video = strstr(update_json, "\"@type\":\"messageVideo\"");
-    if (message_video &&
-        (extract_size_for_file_id(message_video, file_id, size) ||
-         extract_exact_file_size(message_video, "\"video\":{\"video\":{", file_id, size))) {
-        return 1;
+    pattern = find_media_pattern(update_json, &message_start);
+    if (!pattern || !message_start) {
+        return 0;
     }
 
-    message_document = strstr(update_json, "\"@type\":\"messageDocument\"");
-    if (message_document &&
-        (extract_size_for_file_id(message_document, file_id, size) ||
-         extract_exact_file_size(message_document, "\"document\":{\"document\":{", file_id, size))) {
-        return 1;
-    }
-
-    message_animation = strstr(update_json, "\"@type\":\"messageAnimation\"");
-    if (message_animation &&
-        (extract_size_for_file_id(message_animation, file_id, size) ||
-         extract_exact_file_size(message_animation, "\"animation\":{\"animation\":{", file_id, size))) {
-        return 1;
-    }
-
-    message_video_note = strstr(update_json, "\"@type\":\"messageVideoNote\"");
-    if (message_video_note &&
-        (extract_size_for_file_id(message_video_note, file_id, size) ||
-         extract_exact_file_size(message_video_note, "\"video_note\":{\"video\":{", file_id, size))) {
-        return 1;
-    }
-
-    return 0;
+    return extract_size_for_file_id(message_start, file_id, size) ||
+           extract_exact_file_size(message_start, pattern->size_prefix, file_id, size);
 }
 
 static int extract_update_file_id(const char *update_json, int *file_id) {
-    return json_extract_int_after(update_json, "\"file\":{\"id\":", file_id) ||
-           json_extract_int_after(update_json, "\"id\":", file_id);
+    return json_extract_int_after(update_json, "\"file\":{\"id\":", file_id);
 }
 
 static int extract_file_size(const char *update_json, long long *size) {
@@ -899,8 +986,7 @@ static int extract_downloaded_size(const char *update_json, long long *size) {
 }
 
 static int extract_local_file_path(const char *update_json, char *buffer, size_t bufsize) {
-    return json_extract_string_after(update_json, "\"local\":{\"path\":\"", buffer, bufsize) ||
-           json_extract_string_after(update_json, "\"path\":\"", buffer, bufsize);
+    return json_extract_string_after(update_json, "\"local\":{\"path\":\"", buffer, bufsize);
 }
 
 static int is_pending(int file_id) {
@@ -913,10 +999,6 @@ static void remember_pending(int file_id, long long chat_id) {
     pending = find_pending_download(file_id);
     if (pending) {
         pending->chat_id = chat_id;
-        return;
-    }
-
-    if (is_pending(file_id)) {
         return;
     }
 
@@ -947,6 +1029,18 @@ static void forget_pending(int file_id) {
     }
 }
 
+static PendingDownload *remember_pending_and_get(int file_id, long long chat_id) {
+    PendingDownload *pending = find_pending_download(file_id);
+
+    if (pending) {
+        pending->chat_id = chat_id;
+        return pending;
+    }
+
+    remember_pending(file_id, chat_id);
+    return find_pending_download(file_id);
+}
+
 static void signal_handler(int sig) {
     (void)sig;
     running = 0;
@@ -970,7 +1064,20 @@ static void bot_send(const char *json_str) {
 
 static void send_text_message(long long chat_id, const char *text, const char *extra) {
     char payload[2048];
+    char escaped_text[1024];
+    char escaped_extra[128];
     int written;
+
+    if (json_escape_string(text ? text : "", escaped_text, sizeof(escaped_text)) != 0) {
+        log_error("No se pudo escapar el texto de sendMessage para chat_id=%lld", chat_id);
+        return;
+    }
+
+    if (extra && extra[0] != '\0' &&
+        json_escape_string(extra, escaped_extra, sizeof(escaped_extra)) != 0) {
+        log_error("No se pudo escapar @extra de sendMessage para chat_id=%lld", chat_id);
+        return;
+    }
 
     written = snprintf(
         payload,
@@ -985,8 +1092,8 @@ static void send_text_message(long long chat_id, const char *text, const char *e
             "\"text\":{\"@type\":\"formattedText\",\"text\":\"%s\"},"
             "\"disable_web_page_preview\":true,\"clear_draft\":false}}",
         chat_id,
-        extra,
-        text
+        escaped_extra,
+        escaped_text
     );
 
     if (written < 0 || (size_t)written >= sizeof(payload)) {
@@ -999,7 +1106,13 @@ static void send_text_message(long long chat_id, const char *text, const char *e
 
 static void edit_text_message(long long chat_id, long long message_id, const char *text) {
     char payload[2048];
+    char escaped_text[1024];
     int written;
+
+    if (json_escape_string(text ? text : "", escaped_text, sizeof(escaped_text)) != 0) {
+        log_error("No se pudo escapar el texto de editMessageText para message_id=%lld", message_id);
+        return;
+    }
 
     written = snprintf(
         payload,
@@ -1010,7 +1123,7 @@ static void edit_text_message(long long chat_id, long long message_id, const cha
         "\"disable_web_page_preview\":true,\"clear_draft\":false}}",
         chat_id,
         message_id,
-        text
+        escaped_text
     );
 
     if (written < 0 || (size_t)written >= sizeof(payload)) {
@@ -1023,7 +1136,18 @@ static void edit_text_message(long long chat_id, long long message_id, const cha
 
 static void send_tdlib_parameters(int api_id, const char *api_hash, const char *db_dir, const char *files_dir) {
     char params[4096];
+    char escaped_api_hash[512];
+    char escaped_db_dir[PATH_MAX * 2];
+    char escaped_files_dir[PATH_MAX * 2];
     int written;
+
+    if (json_escape_string(api_hash ? api_hash : "", escaped_api_hash, sizeof(escaped_api_hash)) != 0 ||
+        json_escape_string(db_dir ? db_dir : "", escaped_db_dir, sizeof(escaped_db_dir)) != 0 ||
+        json_escape_string(files_dir ? files_dir : "", escaped_files_dir, sizeof(escaped_files_dir)) != 0) {
+        log_error("No se pudieron escapar los parámetros de TDLib");
+        running = 0;
+        return;
+    }
 
     written = snprintf(
         params,
@@ -1045,10 +1169,10 @@ static void send_tdlib_parameters(int api_id, const char *api_hash, const char *
         "\"enable_storage_optimizer\":true,"
         "\"ignore_file_names\":false"
         "}",
-        db_dir,
-        files_dir,
+        escaped_db_dir,
+        escaped_files_dir,
         api_id,
-        api_hash
+        escaped_api_hash
     );
 
     if (written < 0 || (size_t)written >= sizeof(params)) {
@@ -1062,13 +1186,20 @@ static void send_tdlib_parameters(int api_id, const char *api_hash, const char *
 
 static void send_database_key(const char *database_key) {
     char payload[1024];
+    char escaped_database_key[512];
     int written;
+
+    if (json_escape_string(database_key ? database_key : "", escaped_database_key, sizeof(escaped_database_key)) != 0) {
+        log_error("La clave de cifrado de la base de datos es demasiado larga");
+        running = 0;
+        return;
+    }
 
     written = snprintf(
         payload,
         sizeof(payload),
         "{\"@type\":\"checkDatabaseEncryptionKey\",\"encryption_key\":\"%s\"}",
-        database_key ? database_key : ""
+        escaped_database_key
     );
 
     if (written < 0 || (size_t)written >= sizeof(payload)) {
@@ -1082,13 +1213,20 @@ static void send_database_key(const char *database_key) {
 
 static void send_bot_token(const char *bot_token) {
     char auth[1024];
+    char escaped_bot_token[512];
     int written;
+
+    if (json_escape_string(bot_token ? bot_token : "", escaped_bot_token, sizeof(escaped_bot_token)) != 0) {
+        log_error("El BOT_TOKEN es demasiado largo");
+        running = 0;
+        return;
+    }
 
     written = snprintf(
         auth,
         sizeof(auth),
         "{\"@type\":\"checkAuthenticationBotToken\",\"token\":\"%s\"}",
-        bot_token
+        escaped_bot_token
     );
 
     if (written < 0 || (size_t)written >= sizeof(auth)) {
@@ -1195,6 +1333,7 @@ static void request_download(int file_id, long long chat_id) {
     char extra[64];
     char started_at[32];
     int written;
+    PendingDownload *pending;
 
     written = snprintf(
         download_cmd,
@@ -1212,8 +1351,8 @@ static void request_download(int file_id, long long chat_id) {
     snprintf(extra, sizeof(extra), "progress_init:%d", file_id);
     send_text_message(chat_id, "Iniciando descarga...", extra);
     bot_send(download_cmd);
-    remember_pending(file_id, chat_id);
-    format_time_label(time(NULL), started_at, sizeof(started_at));
+    pending = remember_pending_and_get(file_id, chat_id);
+    format_time_label(pending ? pending->started_at : time(NULL), started_at, sizeof(started_at));
     log_info("Vídeo detectado. Solicitando descarga para file_id=%d. Inicio=%s", file_id, started_at);
 }
 
@@ -1393,6 +1532,7 @@ static void handle_file_update(const char *update_json) {
     char src_path[PATH_MAX];
     char final_path[PATH_MAX];
     const char *filename;
+    time_t finished_time;
 
     if (!extract_update_file_id(update_json, &file_id) || !is_pending(file_id)) {
         return;
@@ -1427,10 +1567,11 @@ static void handle_file_update(const char *update_json) {
             edit_text_message(pending->chat_id, pending->progress_message_id, "Descarga completada.");
         }
 
+        finished_time = time(NULL);
         format_time_label(pending ? pending->started_at : (time_t)-1, started_at, sizeof(started_at));
-        format_time_label(time(NULL), finished_at, sizeof(finished_at));
+        format_time_label(finished_time, finished_at, sizeof(finished_at));
         if (pending && pending->started_at != (time_t)-1) {
-            duration_seconds = (long long)(time(NULL) - pending->started_at);
+            duration_seconds = (long long)(finished_time - pending->started_at);
         }
         forget_pending(file_id);
         log_info(
@@ -1449,11 +1590,17 @@ static void handle_file_update(const char *update_json) {
 static void handle_update(const char *update_json, int api_id, const char *api_hash, const char *db_dir,
                           const char *files_dir, const char *bot_token, const char *database_key) {
     char message[512];
+    const char *update_type;
 
     handle_progress_message_result(update_json);
     handle_message_send_succeeded(update_json);
 
-    if (strstr(update_json, "\"@type\":\"error\"")) {
+    update_type = strstr(update_json, "\"@type\":\"");
+    if (!update_type) {
+        return;
+    }
+
+    if (strstr(update_type, "\"@type\":\"error\"") == update_type) {
         memset(message, 0, sizeof(message));
         if (json_extract_error_message(update_json, message, sizeof(message))) {
             log_error("%s", message);
@@ -1466,17 +1613,17 @@ static void handle_update(const char *update_json, int api_id, const char *api_h
         return;
     }
 
-    if (strstr(update_json, "\"@type\":\"updateAuthorizationState\"")) {
+    if (strstr(update_type, "\"@type\":\"updateAuthorizationState\"") == update_type) {
         handle_authorization_state(update_json, api_id, api_hash, db_dir, files_dir, bot_token, database_key);
         return;
     }
 
-    if (strstr(update_json, "\"@type\":\"updateNewMessage\"")) {
+    if (strstr(update_type, "\"@type\":\"updateNewMessage\"") == update_type) {
         handle_new_message(update_json);
         return;
     }
 
-    if (strstr(update_json, "\"@type\":\"updateFile\"")) {
+    if (strstr(update_type, "\"@type\":\"updateFile\"") == update_type) {
         handle_file_update(update_json);
     }
 }
@@ -1492,6 +1639,8 @@ int main(void) {
     char abs_db_dir[PATH_MAX];
     char abs_files_dir[PATH_MAX];
     char abs_download_dir[PATH_MAX];
+    char *api_id_end = NULL;
+    long parsed_api_id;
     int api_id;
 
     signal(SIGINT, signal_handler);
@@ -1516,11 +1665,13 @@ int main(void) {
         return 1;
     }
 
-    api_id = atoi(api_id_str);
-    if (api_id <= 0) {
+    errno = 0;
+    parsed_api_id = strtol(api_id_str, &api_id_end, 10);
+    if (errno != 0 || api_id_end == api_id_str || *api_id_end != '\0' || parsed_api_id <= 0 || parsed_api_id > INT_MAX) {
         log_error("API_ID no es válido");
         return 1;
     }
+    api_id = (int)parsed_api_id;
 
     if (!db_dir_env) {
         db_dir_env = DEFAULT_DB_DIR;
