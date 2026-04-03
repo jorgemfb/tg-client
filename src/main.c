@@ -53,7 +53,9 @@ typedef struct {
     long long chat_id;
     long long temp_progress_message_id;
     long long progress_message_id;
+    long long total_size;
     int last_reported_percent;
+    time_t started_at;
     time_t last_progress_update;
 } PendingDownload;
 
@@ -61,6 +63,23 @@ static PendingDownload pending_downloads[MAX_TRACKED_FILES] = {0};
 static int pending_count = 0;
 
 static int mkdir_p(const char *path);
+
+static void format_time_label(time_t value, char *buffer, size_t bufsize) {
+    struct tm local_tm;
+
+    if (!buffer || bufsize == 0) {
+        return;
+    }
+
+    if (value == (time_t)-1 || localtime_r(&value, &local_tm) == NULL) {
+        snprintf(buffer, bufsize, "desconocida");
+        return;
+    }
+
+    if (strftime(buffer, bufsize, "%Y-%m-%d %H:%M:%S", &local_tm) == 0) {
+        snprintf(buffer, bufsize, "desconocida");
+    }
+}
 
 static PendingDownload *find_pending_download(int file_id) {
     for (int i = 0; i < pending_count; ++i) {
@@ -535,6 +554,31 @@ static int json_extract_int_after(const char *start, const char *pattern, int *o
     return 1;
 }
 
+static int json_extract_long_long_after(const char *start, const char *pattern, long long *out) {
+    char *endptr = NULL;
+    long long value;
+    const char *pos;
+
+    if (!start || !pattern || !out) {
+        return 0;
+    }
+
+    pos = strstr(start, pattern);
+    if (!pos) {
+        return 0;
+    }
+
+    pos += strlen(pattern);
+    errno = 0;
+    value = strtoll(pos, &endptr, 10);
+    if (errno != 0 || endptr == pos || value <= 0) {
+        return 0;
+    }
+
+    *out = value;
+    return 1;
+}
+
 static int json_extract_error_message(const char *json, char *buffer, size_t bufsize) {
     return json_extract_string_after(json, "\"message\":\"", buffer, bufsize);
 }
@@ -557,6 +601,50 @@ static int extract_nested_file_id(
     }
 
     return json_extract_int_after(container, file_pattern, file_id);
+}
+
+static int extract_exact_file_size(const char *start, const char *prefix, int file_id, long long *size) {
+    char pattern[128];
+
+    if (!start || !prefix || !size || file_id <= 0) {
+        return 0;
+    }
+
+    snprintf(pattern, sizeof(pattern), "%s\"@type\":\"file\",\"id\":%d,\"size\":", prefix, file_id);
+    if (json_extract_long_long_after(start, pattern, size)) {
+        return 1;
+    }
+
+    snprintf(pattern, sizeof(pattern), "%s\"@type\":\"file\",\"id\":%d,\"expected_size\":", prefix, file_id);
+    if (json_extract_long_long_after(start, pattern, size)) {
+        return 1;
+    }
+
+    snprintf(pattern, sizeof(pattern), "%s\"id\":%d,\"size\":", prefix, file_id);
+    if (json_extract_long_long_after(start, pattern, size)) {
+        return 1;
+    }
+
+    snprintf(pattern, sizeof(pattern), "%s\"id\":%d,\"expected_size\":", prefix, file_id);
+    return json_extract_long_long_after(start, pattern, size);
+}
+
+static int extract_size_for_file_id(const char *start, int file_id, long long *size) {
+    char marker[64];
+    const char *file;
+
+    if (!start || !size || file_id <= 0) {
+        return 0;
+    }
+
+    snprintf(marker, sizeof(marker), "\"@type\":\"file\",\"id\":%d", file_id);
+    file = strstr(start, marker);
+    if (!file) {
+        return 0;
+    }
+
+    return json_extract_long_long_after(file, "\"size\":", size) ||
+           json_extract_long_long_after(file, "\"expected_size\":", size);
 }
 
 static int extract_message_content_type(const char *update_json, char *buffer, size_t bufsize) {
@@ -703,34 +791,111 @@ static int extract_video_file_id(const char *update_json, int *file_id, char *de
     return 0;
 }
 
+static int extract_message_total_size(const char *update_json, int file_id, long long *size) {
+    const char *message_video;
+    const char *message_document;
+    const char *message_animation;
+    const char *message_video_note;
+
+    if (!update_json || !size) {
+        return 0;
+    }
+
+    message_video = strstr(update_json, "\"@type\":\"messageVideo\"");
+    if (message_video &&
+        (extract_size_for_file_id(message_video, file_id, size) ||
+         extract_exact_file_size(message_video, "\"video\":{\"video\":{", file_id, size))) {
+        return 1;
+    }
+
+    message_document = strstr(update_json, "\"@type\":\"messageDocument\"");
+    if (message_document &&
+        (extract_size_for_file_id(message_document, file_id, size) ||
+         extract_exact_file_size(message_document, "\"document\":{\"document\":{", file_id, size))) {
+        return 1;
+    }
+
+    message_animation = strstr(update_json, "\"@type\":\"messageAnimation\"");
+    if (message_animation &&
+        (extract_size_for_file_id(message_animation, file_id, size) ||
+         extract_exact_file_size(message_animation, "\"animation\":{\"animation\":{", file_id, size))) {
+        return 1;
+    }
+
+    message_video_note = strstr(update_json, "\"@type\":\"messageVideoNote\"");
+    if (message_video_note &&
+        (extract_size_for_file_id(message_video_note, file_id, size) ||
+         extract_exact_file_size(message_video_note, "\"video_note\":{\"video\":{", file_id, size))) {
+        return 1;
+    }
+
+    return 0;
+}
+
 static int extract_update_file_id(const char *update_json, int *file_id) {
     return json_extract_int_after(update_json, "\"file\":{\"id\":", file_id) ||
            json_extract_int_after(update_json, "\"id\":", file_id);
 }
 
-static int extract_file_size(const char *update_json, int *size) {
+static int extract_file_size(const char *update_json, long long *size) {
     const char *file = strstr(update_json, "\"file\":{");
+    const char *video = strstr(update_json, "\"video\":{");
+    const char *document = strstr(update_json, "\"document\":{");
+    const char *animation = strstr(update_json, "\"animation\":{");
+    const char *video_note = strstr(update_json, "\"video_note\":{");
 
     if (file) {
-        if (json_extract_int_after(file, "\"size\":", size) ||
-            json_extract_int_after(file, "\"expected_size\":", size)) {
+        if (json_extract_long_long_after(file, "\"size\":", size) ||
+            json_extract_long_long_after(file, "\"expected_size\":", size)) {
             return 1;
         }
     }
 
-    return json_extract_int_after(update_json, "\"size\":", size) ||
-           json_extract_int_after(update_json, "\"expected_size\":", size);
+    if (video) {
+        if (json_extract_long_long_after(video, "\"video\":{\"@type\":\"file\",\"size\":", size) ||
+            json_extract_long_long_after(video, "\"video\":{\"size\":", size) ||
+            json_extract_long_long_after(video, "\"expected_size\":", size)) {
+            return 1;
+        }
+    }
+
+    if (document) {
+        if (json_extract_long_long_after(document, "\"document\":{\"@type\":\"file\",\"size\":", size) ||
+            json_extract_long_long_after(document, "\"document\":{\"size\":", size) ||
+            json_extract_long_long_after(document, "\"expected_size\":", size)) {
+            return 1;
+        }
+    }
+
+    if (animation) {
+        if (json_extract_long_long_after(animation, "\"animation\":{\"@type\":\"file\",\"size\":", size) ||
+            json_extract_long_long_after(animation, "\"animation\":{\"size\":", size) ||
+            json_extract_long_long_after(animation, "\"expected_size\":", size)) {
+            return 1;
+        }
+    }
+
+    if (video_note) {
+        if (json_extract_long_long_after(video_note, "\"video\":{\"@type\":\"file\",\"size\":", size) ||
+            json_extract_long_long_after(video_note, "\"video\":{\"size\":", size) ||
+            json_extract_long_long_after(video_note, "\"expected_size\":", size)) {
+            return 1;
+        }
+    }
+
+    return json_extract_long_long_after(update_json, "\"size\":", size) ||
+           json_extract_long_long_after(update_json, "\"expected_size\":", size);
 }
 
-static int extract_downloaded_size(const char *update_json, int *size) {
+static int extract_downloaded_size(const char *update_json, long long *size) {
     const char *local = strstr(update_json, "\"local\":{");
 
     if (!local) {
         return 0;
     }
 
-    return json_extract_int_after(local, "\"downloaded_size\":", size) ||
-           json_extract_int_after(local, "\"downloaded_prefix_size\":", size);
+    return json_extract_long_long_after(local, "\"downloaded_size\":", size) ||
+           json_extract_long_long_after(local, "\"downloaded_prefix_size\":", size);
 }
 
 static int extract_local_file_path(const char *update_json, char *buffer, size_t bufsize) {
@@ -760,7 +925,9 @@ static void remember_pending(int file_id, long long chat_id) {
         pending_downloads[pending_count].chat_id = chat_id;
         pending_downloads[pending_count].temp_progress_message_id = 0;
         pending_downloads[pending_count].progress_message_id = 0;
+        pending_downloads[pending_count].total_size = 0;
         pending_downloads[pending_count].last_reported_percent = -1;
+        pending_downloads[pending_count].started_at = time(NULL);
         pending_downloads[pending_count].last_progress_update = 0;
         ++pending_count;
         return;
@@ -1026,6 +1193,7 @@ static void handle_authorization_state(const char *update_json, int api_id, cons
 static void request_download(int file_id, long long chat_id) {
     char download_cmd[256];
     char extra[64];
+    char started_at[32];
     int written;
 
     written = snprintf(
@@ -1045,14 +1213,16 @@ static void request_download(int file_id, long long chat_id) {
     send_text_message(chat_id, "Iniciando descarga...", extra);
     bot_send(download_cmd);
     remember_pending(file_id, chat_id);
-    log_info("Vídeo detectado. Solicitando descarga para file_id=%d", file_id);
+    format_time_label(time(NULL), started_at, sizeof(started_at));
+    log_info("Vídeo detectado. Solicitando descarga para file_id=%d. Inicio=%s", file_id, started_at);
 }
 
 static void handle_new_message(const char *update_json) {
     int file_id = 0;
+    long long total_size = 0;
     char content_type[64];
     char detected_type[64];
-    char preview[512];
+    char preview[4096];
     long long chat_id = 0;
 
     memset(content_type, 0, sizeof(content_type));
@@ -1086,13 +1256,22 @@ static void handle_new_message(const char *update_json) {
 
     log_info("Archivo detectado como %s con file_id=%d", detected_type, file_id);
     request_download(file_id, chat_id);
+    if (extract_message_total_size(update_json, file_id, &total_size)) {
+        PendingDownload *pending = find_pending_download(file_id);
+        if (pending) {
+            pending->total_size = total_size;
+        }
+        log_info("Tamano total detectado para file_id=%d: %lld bytes", file_id, total_size);
+    } else {
+        log_info("No se pudo detectar el tamano total para file_id=%d", file_id);
+    }
 }
 
 static void update_progress_message(const char *update_json, int file_id) {
     PendingDownload *pending;
     char text[256];
-    int downloaded_size = 0;
-    int total_size = 0;
+    long long downloaded_size = 0;
+    long long total_size = 0;
     int percent = 0;
     double downloaded_mb;
     double total_mb;
@@ -1108,8 +1287,11 @@ static void update_progress_message(const char *update_json, int file_id) {
     }
 
     extract_file_size(update_json, &total_size);
+    if (total_size <= 0 && pending->total_size > 0) {
+        total_size = pending->total_size;
+    }
     if (total_size > 0) {
-        percent = (int)(((long long)downloaded_size * 100LL) / (long long)total_size);
+        percent = (int)((downloaded_size * 100LL) / total_size);
         if (percent > 100) {
             percent = 100;
         }
@@ -1205,6 +1387,9 @@ static void handle_message_send_succeeded(const char *update_json) {
 static void handle_file_update(const char *update_json) {
     int file_id = 0;
     PendingDownload *pending;
+    char started_at[32];
+    char finished_at[32];
+    long long duration_seconds = -1;
     char src_path[PATH_MAX];
     char final_path[PATH_MAX];
     const char *filename;
@@ -1242,8 +1427,19 @@ static void handle_file_update(const char *update_json) {
             edit_text_message(pending->chat_id, pending->progress_message_id, "Descarga completada.");
         }
 
+        format_time_label(pending ? pending->started_at : (time_t)-1, started_at, sizeof(started_at));
+        format_time_label(time(NULL), finished_at, sizeof(finished_at));
+        if (pending && pending->started_at != (time_t)-1) {
+            duration_seconds = (long long)(time(NULL) - pending->started_at);
+        }
         forget_pending(file_id);
-        log_info("Descarga completada: %s", final_path);
+        log_info(
+            "Descarga completada: %s | inicio=%s | fin=%s | duracion=%lld s",
+            final_path,
+            started_at,
+            finished_at,
+            duration_seconds
+        );
         return;
     }
 
