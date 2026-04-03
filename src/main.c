@@ -48,6 +48,7 @@ static FILE *tdlib_log_file = NULL;
 static char logs_dir[PATH_MAX] = {0};
 static time_t last_log_cleanup = 0;
 
+
 typedef struct {
     int file_id;
     long long chat_id;
@@ -785,25 +786,22 @@ static int extract_chat_id(const char *update_json, long long *chat_id) {
 }
 
 static int extract_message_id(const char *update_json, long long *message_id) {
-    const char *pos;
-    const char *pattern;
+    const char *message_obj;
 
     if (!update_json || !message_id) {
         return 0;
     }
 
-    pos = strstr(update_json, "\"message\":{\"id\":");
-    if (pos) {
-        pattern = "\"message\":{\"id\":";
-    } else {
-        pos = strstr(update_json, "\"id\":");
-        if (!pos) {
-            return 0;
-        }
-        pattern = "\"id\":";
+    message_obj = strstr(update_json, "\"message\":{");
+    if (message_obj && parse_long_long_after_pattern(message_obj, "\"id\":", message_id)) {
+        return 1;
     }
 
-    return parse_long_long_after_pattern(pos, pattern, message_id);
+    if (parse_long_long_after_pattern(update_json, "\"@type\":\"message\",\"id\":", message_id)) {
+        return 1;
+    }
+
+    return parse_long_long_after_pattern(update_json, "\"id\":", message_id);
 }
 
 static int extract_old_message_id(const char *update_json, long long *message_id) {
@@ -880,7 +878,23 @@ static int extract_message_total_size(const char *update_json, int file_id, long
 }
 
 static int extract_update_file_id(const char *update_json, int *file_id) {
-    return json_extract_int_after(update_json, "\"file\":{\"id\":", file_id);
+    const char *file;
+
+    if (!update_json || !file_id) {
+        return 0;
+    }
+
+    if (json_extract_int_after(update_json, "\"file\":{\"@type\":\"file\",\"id\":", file_id) ||
+        json_extract_int_after(update_json, "\"file\":{\"id\":", file_id)) {
+        return 1;
+    }
+
+    file = strstr(update_json, "\"file\":{");
+    if (!file) {
+        return 0;
+    }
+
+    return json_extract_int_after(file, "\"id\":", file_id);
 }
 
 static int extract_file_size(const char *update_json, long long *size) {
@@ -945,7 +959,18 @@ static int extract_downloaded_size(const char *update_json, long long *size) {
 }
 
 static int extract_local_file_path(const char *update_json, char *buffer, size_t bufsize) {
-    return json_extract_string_after(update_json, "\"local\":{\"path\":\"", buffer, bufsize);
+    const char *local;
+
+    if (!update_json || !buffer || bufsize == 0) {
+        return 0;
+    }
+
+    local = strstr(update_json, "\"local\":{");
+    if (!local) {
+        return 0;
+    }
+
+    return json_extract_string_after(local, "\"path\":\"", buffer, bufsize);
 }
 
 static int is_pending(int file_id) {
@@ -1678,6 +1703,7 @@ int main(void) {
     log_info("Cliente TDLib creado");
     bot_send("{\"@type\":\"getAuthorizationState\"}");
     log_info("Entrando en bucle de eventos...");
+    log_info("=== BINARIO NUEVO EJECUTANDOSE ===\n");
 
     while (running) {
         const char *result = td_json_client_receive(client, 1.0);
