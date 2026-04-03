@@ -12,6 +12,7 @@
  *   TDLIB_DB
  *   TDLIB_FILES
  *   DOWNLOAD_DIR
+ * Version: v0.0.6 build:03042026
  */
 
 #define _GNU_SOURCE
