@@ -110,6 +110,19 @@ static const size_t media_pattern_count = sizeof(media_patterns) / sizeof(media_
 
 static int mkdir_p(const char *path);
 
+static FILE *get_log_target(void) {
+    return app_log_file ? app_log_file : stderr;
+}
+
+static void log_vline(const char *level, const char *fmt, va_list args) {
+    FILE *target = get_log_target();
+
+    fprintf(target, "[%s] ", level);
+    vfprintf(target, fmt, args);
+    fputc('\n', target);
+    fflush(target);
+}
+
 static void format_time_label(time_t value, char *buffer, size_t bufsize) {
     struct tm local_tm;
 
@@ -385,38 +398,26 @@ static const char *getenv_any(const char *first, const char *second) {
 
 static void log_line(const char *level, const char *fmt, ...) {
     va_list args;
-    FILE *target = app_log_file ? app_log_file : stderr;
 
-    fprintf(target, "[%s] ", level);
     va_start(args, fmt);
-    vfprintf(target, fmt, args);
+    log_vline(level, fmt, args);
     va_end(args);
-    fputc('\n', target);
-    fflush(target);
 }
 
 static void log_info(const char *fmt, ...) {
     va_list args;
-    FILE *target = app_log_file ? app_log_file : stderr;
 
-    fprintf(target, "[INFO] ");
     va_start(args, fmt);
-    vfprintf(target, fmt, args);
+    log_vline("INFO", fmt, args);
     va_end(args);
-    fputc('\n', target);
-    fflush(target);
 }
 
 static void log_error(const char *fmt, ...) {
     va_list args;
-    FILE *target = app_log_file ? app_log_file : stderr;
 
-    fprintf(target, "[ERROR] ");
     va_start(args, fmt);
-    vfprintf(target, fmt, args);
+    log_vline("ERROR", fmt, args);
     va_end(args);
-    fputc('\n', target);
-    fflush(target);
 }
 
 static int mkdir_p(const char *path) {
@@ -643,32 +644,7 @@ static int json_extract_string_after(const char *start, const char *pattern, cha
     return *pos == '"';
 }
 
-static int json_extract_int_after(const char *start, const char *pattern, int *out) {
-    char *endptr = NULL;
-    long value;
-    const char *pos;
-
-    if (!start || !pattern || !out) {
-        return 0;
-    }
-
-    pos = strstr(start, pattern);
-    if (!pos) {
-        return 0;
-    }
-
-    pos += strlen(pattern);
-    errno = 0;
-    value = strtol(pos, &endptr, 10);
-    if (errno != 0 || endptr == pos || value <= 0 || value > INT_MAX) {
-        return 0;
-    }
-
-    *out = (int)value;
-    return 1;
-}
-
-static int json_extract_long_long_after(const char *start, const char *pattern, long long *out) {
+static int parse_long_long_after_pattern(const char *start, const char *pattern, long long *out) {
     char *endptr = NULL;
     long long value;
     const char *pos;
@@ -685,7 +661,39 @@ static int json_extract_long_long_after(const char *start, const char *pattern, 
     pos += strlen(pattern);
     errno = 0;
     value = strtoll(pos, &endptr, 10);
-    if (errno != 0 || endptr == pos || value <= 0) {
+    if (errno != 0 || endptr == pos) {
+        return 0;
+    }
+
+    *out = value;
+    return 1;
+}
+
+static int json_extract_int_after(const char *start, const char *pattern, int *out) {
+    long value;
+    long long parsed_value;
+
+    if (!start || !pattern || !out) {
+        return 0;
+    }
+
+    if (!parse_long_long_after_pattern(start, pattern, &parsed_value)) {
+        return 0;
+    }
+
+    value = (long)parsed_value;
+    if (parsed_value <= 0 || parsed_value > INT_MAX || (long long)value != parsed_value) {
+        return 0;
+    }
+
+    *out = (int)value;
+    return 1;
+}
+
+static int json_extract_long_long_after(const char *start, const char *pattern, long long *out) {
+    long long value;
+
+    if (!parse_long_long_after_pattern(start, pattern, &value) || value <= 0) {
         return 0;
     }
 
@@ -773,34 +781,12 @@ static int extract_message_content_type(const char *update_json, char *buffer, s
 }
 
 static int extract_chat_id(const char *update_json, long long *chat_id) {
-    char *endptr = NULL;
-    long long value;
-    const char *pos;
-
-    if (!update_json || !chat_id) {
-        return 0;
-    }
-
-    pos = strstr(update_json, "\"chat_id\":");
-    if (!pos) {
-        return 0;
-    }
-
-    pos += strlen("\"chat_id\":");
-    errno = 0;
-    value = strtoll(pos, &endptr, 10);
-    if (errno != 0 || endptr == pos) {
-        return 0;
-    }
-
-    *chat_id = value;
-    return 1;
+    return parse_long_long_after_pattern(update_json, "\"chat_id\":", chat_id);
 }
 
 static int extract_message_id(const char *update_json, long long *message_id) {
-    char *endptr = NULL;
-    long long value;
     const char *pos;
+    const char *pattern;
 
     if (!update_json || !message_id) {
         return 0;
@@ -808,47 +794,20 @@ static int extract_message_id(const char *update_json, long long *message_id) {
 
     pos = strstr(update_json, "\"message\":{\"id\":");
     if (pos) {
-        pos += strlen("\"message\":{\"id\":");
+        pattern = "\"message\":{\"id\":";
     } else {
         pos = strstr(update_json, "\"id\":");
         if (!pos) {
             return 0;
         }
-        pos += strlen("\"id\":");
-    }
-    errno = 0;
-    value = strtoll(pos, &endptr, 10);
-    if (errno != 0 || endptr == pos) {
-        return 0;
+        pattern = "\"id\":";
     }
 
-    *message_id = value;
-    return 1;
+    return parse_long_long_after_pattern(pos, pattern, message_id);
 }
 
 static int extract_old_message_id(const char *update_json, long long *message_id) {
-    char *endptr = NULL;
-    long long value;
-    const char *pos;
-
-    if (!update_json || !message_id) {
-        return 0;
-    }
-
-    pos = strstr(update_json, "\"old_message_id\":");
-    if (!pos) {
-        return 0;
-    }
-
-    pos += strlen("\"old_message_id\":");
-    errno = 0;
-    value = strtoll(pos, &endptr, 10);
-    if (errno != 0 || endptr == pos) {
-        return 0;
-    }
-
-    *message_id = value;
-    return 1;
+    return parse_long_long_after_pattern(update_json, "\"old_message_id\":", message_id);
 }
 
 static int extract_extra(const char *update_json, char *buffer, size_t bufsize) {
@@ -993,6 +952,18 @@ static int is_pending(int file_id) {
     return find_pending_download(file_id) != NULL;
 }
 
+static void init_pending_download(PendingDownload *pending, int file_id, long long chat_id, time_t started_at) {
+    if (!pending) {
+        return;
+    }
+
+    memset(pending, 0, sizeof(*pending));
+    pending->file_id = file_id;
+    pending->chat_id = chat_id;
+    pending->last_reported_percent = -1;
+    pending->started_at = started_at;
+}
+
 static void remember_pending(int file_id, long long chat_id) {
     PendingDownload *pending;
 
@@ -1003,14 +974,7 @@ static void remember_pending(int file_id, long long chat_id) {
     }
 
     if (pending_count < MAX_TRACKED_FILES) {
-        pending_downloads[pending_count].file_id = file_id;
-        pending_downloads[pending_count].chat_id = chat_id;
-        pending_downloads[pending_count].temp_progress_message_id = 0;
-        pending_downloads[pending_count].progress_message_id = 0;
-        pending_downloads[pending_count].total_size = 0;
-        pending_downloads[pending_count].last_reported_percent = -1;
-        pending_downloads[pending_count].started_at = time(NULL);
-        pending_downloads[pending_count].last_progress_update = 0;
+        init_pending_download(&pending_downloads[pending_count], file_id, chat_id, time(NULL));
         ++pending_count;
         return;
     }
