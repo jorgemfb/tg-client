@@ -461,6 +461,113 @@ static int mkdir_p(const char *path) {
     return 0;
 }
 
+static int ensure_parent_dir_exists(const char *path) {
+    char parent[PATH_MAX];
+    const char *slash;
+    size_t len;
+
+    if (!path || !path[0]) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    slash = strrchr(path, '/');
+    if (!slash) {
+        return 0;
+    }
+
+    len = (size_t)(slash - path);
+    if (len == 0) {
+        return 0;
+    }
+
+    if (len >= sizeof(parent)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    memcpy(parent, path, len);
+    parent[len] = '\0';
+
+    return mkdir_p(parent);
+}
+
+static int copy_file_contents(const char *src_path, const char *dst_path) {
+    int src_fd = -1;
+    int dst_fd = -1;
+    struct stat st;
+    mode_t mode = 0600;
+    char buffer[8192];
+    ssize_t bytes_read;
+
+    if (!src_path || !dst_path) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    src_fd = open(src_path, O_RDONLY);
+    if (src_fd < 0) {
+        return -1;
+    }
+
+    if (fstat(src_fd, &st) == 0) {
+        mode = st.st_mode & 0777;
+    }
+
+    dst_fd = open(dst_path, O_WRONLY | O_CREAT | O_TRUNC, mode);
+    if (dst_fd < 0) {
+        int saved_errno = errno;
+        close(src_fd);
+        errno = saved_errno;
+        return -1;
+    }
+
+    while ((bytes_read = read(src_fd, buffer, sizeof(buffer))) > 0) {
+        ssize_t written_total = 0;
+
+        while (written_total < bytes_read) {
+            ssize_t bytes_written = write(dst_fd, buffer + written_total, (size_t)(bytes_read - written_total));
+
+            if (bytes_written < 0) {
+                int saved_errno = errno;
+                close(src_fd);
+                close(dst_fd);
+                unlink(dst_path);
+                errno = saved_errno;
+                return -1;
+            }
+
+            written_total += bytes_written;
+        }
+    }
+
+    if (bytes_read < 0) {
+        int saved_errno = errno;
+        close(src_fd);
+        close(dst_fd);
+        unlink(dst_path);
+        errno = saved_errno;
+        return -1;
+    }
+
+    if (close(src_fd) != 0) {
+        int saved_errno = errno;
+        close(dst_fd);
+        unlink(dst_path);
+        errno = saved_errno;
+        return -1;
+    }
+
+    if (close(dst_fd) != 0) {
+        int saved_errno = errno;
+        unlink(dst_path);
+        errno = saved_errno;
+        return -1;
+    }
+
+    return 0;
+}
+
 static int make_absolute_path(const char *input, char *output, size_t output_size) {
     char cwd[PATH_MAX];
     int needed;
@@ -1714,14 +1821,31 @@ static void handle_file_update(const char *update_json) {
             return;
         }
 
-        if (rename(src_path, final_path) != 0) {
-            log_error("No se pudo mover '%s' a '%s': %s", src_path, final_path, strerror(errno));
-            if (pending && pending->progress_message_id != 0) {
-                edit_text_message(pending->chat_id, pending->progress_message_id, "La descarga terminó, pero no se pudo mover el archivo.");
-            } else if (pending) {
-                send_text_message(pending->chat_id, "La descarga terminó, pero no se pudo mover el archivo.", NULL);
-            }
+        if (ensure_parent_dir_exists(final_path) != 0) {
+            log_error("No se pudo preparar el destino para '%s': %s", filename, strerror(errno));
             return;
+        }
+
+        if (rename(src_path, final_path) != 0) {
+            if (errno == EXDEV) {
+                if (copy_file_contents(src_path, final_path) != 0 || unlink(src_path) != 0) {
+                    log_error("No se pudo mover '%s' a '%s': %s", src_path, final_path, strerror(errno));
+                    if (pending && pending->progress_message_id != 0) {
+                        edit_text_message(pending->chat_id, pending->progress_message_id, "La descarga terminó, pero no se pudo mover el archivo.");
+                    } else if (pending) {
+                        send_text_message(pending->chat_id, "La descarga terminó, pero no se pudo mover el archivo.", NULL);
+                    }
+                    return;
+                }
+            } else {
+                log_error("No se pudo mover '%s' a '%s': %s", src_path, final_path, strerror(errno));
+                if (pending && pending->progress_message_id != 0) {
+                    edit_text_message(pending->chat_id, pending->progress_message_id, "La descarga terminó, pero no se pudo mover el archivo.");
+                } else if (pending) {
+                    send_text_message(pending->chat_id, "La descarga terminó, pero no se pudo mover el archivo.", NULL);
+                }
+                return;
+            }
         }
 
         if (pending && pending->progress_message_id != 0) {

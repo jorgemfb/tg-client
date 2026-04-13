@@ -1,0 +1,71 @@
+# Entorno
+ENV=development
+
+# Logging
+LOG_LEVEL=INFO
+
+# Ruta de módulos (por si quieres desacoplarlo)
+MODULE_PATH=modules
+
+# Activar debug interno
+CORE_DEBUG=true
+
+# Número máximo de módulos activos simultáneamente (por si escalas)
+MAX_MODULES=50
+
+# Timeout global de ejecución de módulos (ms)
+MODULE_TIMEOUT=5000
+
+# Tipo de sistema de eventos: sync | async
+EVENT_MODE=sync
+
+# Cola (cuando metas asyncio o broker)
+EVENT_QUEUE_SIZE=1000
+
+# TDLib
+API_ID=16628469
+API_HASH=37feb14e4c0126d41dc06e4adff1a63f
+BOT_TOKEN=7600463296:AAEej8vJewfR0JcYK90-ZBjOGTkAQshj-KU
+TDLIB_DB=tdlib
+TDLIB_FILES=tdlib/files
+
+# Ruta de almacenamiento TDLib
+# TDLIB_DB_PATH=/srv/storage/tdlib
+TDLIB_DB_PATH=./descargas/
+# Número de teléfono
+TDLIB_PHONE=+34682320711
+
+# Encriptación DB
+TDLIB_ENCRYPTION_KEY=super_secret_key
+
+# Motor de inferencia
+AI_ENABLED=true
+AI_PROVIDER=qwen
+
+# Endpoint local o remoto
+AI_ENDPOINT=http://192.168.1.100:8000
+
+# Modelo
+AI_MODEL=qwen2.5
+
+# Timeout IA
+AI_TIMEOUT=10000
+
+# Ruta base
+DATA_PATH=/srv/storage
+
+# Ruta descargas
+# DOWNLOAD_PATH=/srv/storage/downloads
+DOWNLOAD_PATH=./descargas
+
+# Logs
+LOG_PATH=./logs
+
+# Nivel persistencia
+PERSISTENCE_ENABLED=true
+
+# Secret interno
+CORE_SECRET_KEY=change_this_now
+
+# Permitir módulos externos
+ALLOW_EXTERNAL_MODULES=false
